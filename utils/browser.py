@@ -185,7 +185,6 @@ def get_browser_context() -> BrowserContext:
             user_data_dir = config.CHROME_USER_DATA_DIR
             if not user_data_dir:
                 # Fallback ke local 'user_data' folder agar tetap Persistent (bukan Incognito)
-                import os
                 user_data_dir = os.path.join(config.BASE_DIR, "user_data")
                 logger.info(f"⚠️ No CHROME_USER_DATA_DIR set. Using local persistent dir: {user_data_dir}")
             
