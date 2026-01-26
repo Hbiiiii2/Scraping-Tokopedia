@@ -36,16 +36,30 @@ def build_search_url(keyword: str) -> str:
 
 
 def _first_text(locator) -> str:
+    """Get first element text dengan optimasi untuk menghindari blocking lama."""
     try:
+        # Cek count dulu (lebih cepat daripada langsung first)
+        count = locator.count()
+        if count == 0:
+            return ""
+        # Ambil text dari first element
         return (locator.first.inner_text() or "").strip()
-    except Exception:
+    except Exception as e:
+        # Skip jika error (element tidak ada atau page closed)
         return ""
 
 
 def _first_attr(locator, attr: str) -> str:
+    """Get first element attribute dengan optimasi untuk menghindari blocking lama."""
     try:
+        # Cek count dulu (lebih cepat daripada langsung first)
+        count = locator.count()
+        if count == 0:
+            return ""
+        # Ambil attribute dari first element
         return (locator.first.get_attribute(attr) or "").strip()
-    except Exception:
+    except Exception as e:
+        # Skip jika error (element tidak ada atau page closed)
         return ""
 
 
@@ -68,6 +82,98 @@ def _normalize_url(url: str) -> str:
     if url.startswith("/"):
         return config.TOKOPEDIA_BASE_URL + url
     return url
+
+
+_NON_PRODUCT_FIRST_SEGMENTS = {
+    "search",
+    "cart",
+    "help",
+    "promo",
+    "discover",
+    "blog",
+    "about",
+    "careers",
+    "mitra",
+    "seller",
+    "admin",
+    "events",
+    "ta",
+    "login",
+    "register",
+    "oauth",
+    "category",
+    "kategori",
+}
+
+
+def _looks_like_product_url(url: str) -> bool:
+    """
+    Tokopedia product URL umumnya seperti:
+    - https://www.tokopedia.com/{shop_slug}/{product_slug}
+    - kadang ada /p/ juga, tapi tidak selalu.
+    """
+    if not url:
+        return False
+
+    u = _normalize_url(url)
+    try:
+        parsed = urllib.parse.urlparse(u)
+    except Exception:
+        return False
+
+    host = (parsed.netloc or "").lower()
+    if "tokopedia.com" not in host:
+        return False
+
+    path = parsed.path or ""
+    if not path or path == "/":
+        return False
+
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return False
+
+    # Support lama: /p/....
+    if "p" in segments and "/p/" in path:
+        return True
+
+    # Umumnya product: /{shop}/{product}
+    if len(segments) < 2:
+        return False
+
+    first = segments[0].lower()
+    if first in _NON_PRODUCT_FIRST_SEGMENTS:
+        return False
+
+    # Segment kedua biasanya slug produk, bukan halaman umum
+    second = segments[1].lower()
+    if second in {"category", "kategori"}:
+        return False
+
+    # Filter halaman kategori/fitur umum yang bukan produk
+    if "search" in path.lower():
+        return False
+
+    return True
+
+
+def _pick_product_url_from_card(card) -> str:
+    """
+    Ambil URL produk dari card dengan cara yang robust.
+    Jangan hardcode '/p/' karena Tokopedia sering pakai /{shop}/{product}.
+    """
+    try:
+        links = card.locator("a[href]")
+        link_count = links.count()
+        # Scan beberapa link saja biar tetap cepat, tapi cukup robust
+        for j in range(min(link_count, 25)):
+            href = _first_attr(links.nth(j), "href")
+            href_norm = _normalize_url(href)
+            if _looks_like_product_url(href_norm):
+                return href_norm
+    except Exception:
+        return ""
+    return ""
 
 
 @retry(stop=stop_after_attempt(config.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -205,17 +311,17 @@ def search_candidates(page, keyword: str, *, max_candidates: int = 30) -> List[D
                 logger.error(f"❌ Failed to load page content: {e3}")
                 raise Exception("Halaman tidak bisa dimuat atau diblokir") from e3
 
-    # Scroll untuk load lebih banyak kartu (lazy loading)
-    logger.info("STEP: Scrolling to trigger lazy loading...")
-    for i in range(8):  # Increased: 6 -> 8
-        page.mouse.wheel(0, 1500)  # Increased scroll: 1200 -> 1500
-        random_delay(1.0, 2.0)  # Increased delay: 0.6-1.3 -> 1.0-2.0
+    # Scroll untuk load kartu (lazy loading) - dikurangi karena hanya butuh 2 produk
+    logger.info("STEP: Scrolling to trigger lazy loading (minimal scroll untuk 2 produk)...")
+    for i in range(3):  # Reduced: hanya 3 scroll untuk 2 produk pertama
+        page.mouse.wheel(0, 1000)  # Scroll lebih kecil
+        random_delay(0.5, 1.0)  # Delay lebih pendek
         if i % 2 == 0:
-            logger.debug(f"Scrolled {i+1}/8 times...")
+            logger.debug(f"Scrolled {i+1}/3 times...")
     
-    # Wait extra untuk lazy loading
+    # Wait minimal untuk lazy loading
     logger.debug("Waiting for lazy-loaded content...")
-    random_delay(2.0, 3.0)
+    random_delay(1.0, 1.5)  # Reduced delay
 
     candidates: List[Dict[str, Any]] = []
 
@@ -284,28 +390,43 @@ def search_candidates(page, keyword: str, *, max_candidates: int = 30) -> List[D
         logger.warning("⚠️ Cards locator is None")
         return []
 
-    logger.info(f"STEP: Extracting data from {card_count} cards...")
+    logger.info(f"STEP: Extracting data from {card_count} cards (target: {max_candidates} produk)...")
     extracted_count = 0
     
-    for i in range(min(card_count, max_candidates * 2)):  # ambil lebih, nanti diranking
+    # Loop hanya sampai dapat max_candidates produk yang valid (untuk efisiensi)
+    # Optimasi: cek lebih sedikit card karena kita hanya butuh 2 produk
+    max_cards_to_check = min(card_count, max_candidates * 5)  # Cek max 10 cards untuk 2 produk
+    for i in range(max_cards_to_check):
         card = cards.nth(i)
         try:
-            # Name - coba multiple selector dengan fallback
+            # OPTIMASI: Cek URL dulu (lebih cepat) - tapi harus robust (tidak hanya '/p/')
+            product_url = _pick_product_url_from_card(card)
+            
+            # Jika tidak ada URL di quick check, skip card ini (bukan produk valid)
+            if not product_url:
+                # Debug: tampilkan 1 href pertama (kalau ada) untuk bantu troubleshooting selector
+                try:
+                    first_href = _first_attr(card.locator("a[href]"), "href")
+                    first_href = _normalize_url(first_href) if first_href else ""
+                    logger.debug(
+                        f"Card {i+1}/{card_count}: Skip cepat - tidak ada product URL. First href: '{first_href[:80]}...'"
+                    )
+                except Exception:
+                    logger.debug(f"Card {i+1}/{card_count}: Skip cepat - tidak ada product URL")
+                continue
+            
+            # Name - coba multiple selector dengan fallback (prioritaskan yang cepat)
             name = ""
             name_selectors = [
-                '[data-testid="spnSRPProdName"]',
+                '[data-testid="spnSRPProdName"]',  # Paling umum
                 '[data-testid="lblProductName"]',
+                'a[href]',  # Link text (cepat)
                 'span[title]',
                 'a[title]',
                 'h3',
                 'h2',
-                'h1',
-                'div[class*="name"]',
-                'div[class*="title"]',
-                'span[class*="name"]',
-                'a[href*="/p/"]',  # Link text bisa jadi nama produk
             ]
-            for name_sel in name_selectors:
+            for name_sel in name_selectors[:4]:  # Batasi hanya 4 selector pertama untuk speed
                 try:
                     name = _first_text(card.locator(name_sel))
                     if name and len(name.strip()) > 3:  # Minimal 3 karakter
@@ -316,65 +437,47 @@ def search_candidates(page, keyword: str, *, max_candidates: int = 30) -> List[D
             # Jika masih tidak ada name, coba ambil dari innerText card secara langsung
             if not name:
                 try:
-                    name = _first_text(card)
-                    # Clean up - ambil baris pertama saja
-                    if name:
-                        name = name.split('\n')[0].strip()
-                        if len(name) > 100:  # Terlalu panjang, mungkin bukan nama
-                            name = ""
+                    # Coba ambil text dari link yang URL-nya mirip produk dulu (lebih cepat & akurat)
+                    links = card.locator("a[href]")
+                    for j in range(min(links.count(), 5)):
+                        href = _normalize_url(_first_attr(links.nth(j), "href"))
+                        if href and (_looks_like_product_url(href) or href == product_url):
+                            name = _first_text(links.nth(j))
+                            if name and len(name.strip()) > 3:
+                                name = name.strip()
+                                break
+                    # Jika masih tidak ada, ambil dari card secara langsung
+                    if not name:
+                        name = _first_text(card)
+                        # Clean up - ambil baris pertama saja
+                        if name:
+                            name = name.split('\n')[0].strip()
+                            if len(name) > 100:  # Terlalu panjang, mungkin bukan nama
+                                name = ""
                 except Exception:
                     pass
             
-            # URL: biasanya ada <a> utama di card - coba multiple cara
-            product_url = ""
-            # Coba cari link ke product page
-            url_selectors = [
-                'a[href*="/p/"]',  # Product page link
-                'a[href*="tokopedia.com"][href*="/p/"]',
-                'a[href*="tokopedia.com"]',  # Any tokopedia link
-                'a[href]',  # Any link
-            ]
-            for url_sel in url_selectors:
-                try:
-                    href = _first_attr(card.locator(url_sel), "href")
-                    if href:
-                        href_normalized = _normalize_url(href)
-                        # Validasi: harus link ke produk Tokopedia
-                        if "/p/" in href_normalized or ("tokopedia.com" in href_normalized and "product" in href_normalized.lower()):
-                            product_url = href_normalized
-                            break
-                except Exception:
-                    continue
+            # URL sudah diambil di quick check di atas, tidak perlu cek lagi
             
-            # Jika masih tidak ada URL, coba cari semua link di card
-            if not product_url:
-                try:
-                    all_links = card.locator("a[href]")
-                    for j in range(min(all_links.count(), 5)):  # Cek max 5 link pertama
-                        href = _first_attr(all_links.nth(j), "href")
-                        if href and "/p/" in href:
-                            product_url = _normalize_url(href)
-                            break
-                except Exception:
-                    pass
-            
-            # Price - coba multiple selector
+            # Price - coba multiple selector (batasi untuk speed)
             price_text = ""
             price_selectors = [
-                '[data-testid="spnSRPProdPrice"]',
+                '[data-testid="spnSRPProdPrice"]',  # Paling umum
                 '[data-testid="lblProductPrice"]',
                 'span:has-text("Rp")',
-                'div:has-text("Rp")',
-                '[class*="price"]',
-                '[class*="Price"]',
             ]
-            for price_sel in price_selectors:
+            for price_sel in price_selectors[:3]:  # Batasi hanya 3 selector pertama
                 try:
                     price_text = _first_text(card.locator(price_sel))
                     if price_text and "rp" in price_text.lower():
                         break
                 except Exception:
                     continue
+
+            # Heuristik: buang card non-produk yang sering kebaca "Kategori"
+            if (not price_text) and name and name.strip().lower() in {"kategori", "category"}:
+                logger.debug(f"Card {i+1}/{card_count}: Skip - bukan produk (name='{name}')")
+                continue
             
             price = extract_price_number(price_text) if price_text else None
             currency = extract_currency(price_text) if price_text else "IDR"
@@ -396,25 +499,31 @@ def search_candidates(page, keyword: str, *, max_candidates: int = 30) -> List[D
                 except Exception:
                     continue
 
-            # Image URL - coba multiple attribute
+            # Image URL - coba multiple attribute (skip jika error, tidak critical)
             image_url = ""
             try:
                 img_locator = card.locator("img")
-                if img_locator.count() > 0:
+                img_count = img_locator.count()
+                if img_count > 0:
                     img = img_locator.first
-                    image_url = _normalize_url(
-                        _safe_attr(img, "src") or 
-                        _safe_attr(img, "data-src") or 
-                        _safe_attr(img, "data-lazy-src") or
-                        _safe_attr(img, "data-original")
-                    )
+                    # Coba ambil src dulu (paling umum)
+                    image_url = _normalize_url(_safe_attr(img, "src") or "")
+                    # Jika tidak ada, coba data-src
+                    if not image_url:
+                        image_url = _normalize_url(_safe_attr(img, "data-src") or "")
             except Exception as img_err:
-                logger.debug(f"Card {i+1}: Image extract failed: {img_err}")
+                # Image tidak critical, skip saja
                 pass
 
             # Validasi: minimal harus ada name atau URL
             if not product_url and not name:
-                logger.debug(f"Card {i}: Skipped - no name and no URL")
+                # Debug: coba ambil sedikit info dari card untuk debugging
+                try:
+                    card_text_preview = _first_text(card)
+                    card_text_snippet = card_text_preview[:100] if card_text_preview else "(empty)"
+                    logger.debug(f"Card {i+1}/{card_count}: Skipped - no name and no URL. Card preview: '{card_text_snippet}...' (mungkin bukan produk valid)")
+                except Exception:
+                    logger.debug(f"Card {i+1}/{card_count}: Skipped - no name and no URL (tidak bisa membaca card content)")
                 continue
             
             # Jika tidak ada name, coba ambil dari URL atau gunakan placeholder
@@ -448,8 +557,9 @@ def search_candidates(page, keyword: str, *, max_candidates: int = 30) -> List[D
             logger.debug(f"Traceback: {traceback.format_exc()}")
             continue
 
+        # Early exit jika sudah dapat cukup produk valid
         if len(candidates) >= max_candidates:
-            logger.info(f"Reached max candidates limit: {max_candidates}")
+            logger.info(f"✅ Reached max candidates limit: {max_candidates} produk valid ditemukan")
             break
     
     logger.info(f"✅ Extracted {extracted_count} products from {card_count} cards")

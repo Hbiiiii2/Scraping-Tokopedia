@@ -27,6 +27,7 @@ except Exception:
 
 import io
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import pandas as pd
@@ -88,10 +89,10 @@ def run_pipeline(
             progress_cb((idx - 1) / max(len(keywords), 1))
 
             try:
-                # 1) Search candidates (20-30)
-                status_cb(f"  - Mencari produk untuk '{kw}'...")
+                # 1) Search candidates - HANYA 2 PRODUK (untuk mempercepat)
+                status_cb(f"  - Mencari produk untuk '{kw}' (maksimal 2 produk)...")
                 try:
-                    candidates = search_candidates(page, kw, max_candidates=config.MAX_CANDIDATES_TO_COLLECT)
+                    candidates = search_candidates(page, kw, max_candidates=2)
                 except TokopediaBlockedError as be:
                     # Ini kondisi nyata: captcha/blocked. Beri instruksi jelas.
                     status_cb("  - ❌ Tokopedia meminta verifikasi / captcha.")
@@ -104,33 +105,45 @@ def run_pipeline(
                     status_cb(f"  - ⚠️ Tidak ada kandidat ditemukan untuk '{kw}'")
                     continue
 
-                # 2) Detail scraping untuk kandidat (batasi supaya tidak berat)
-                status_cb(f"  - Mengambil detail produk ({len(candidates)} kandidat)...")
+                # 2) Detail scraping untuk 2 produk (ambil deskripsi dan foto)
+                logger.info(f"STEP: Starting detail scraping for {len(candidates)} candidates...")
+                status_cb(f"  - Mengambil detail produk (deskripsi & foto) untuk {len(candidates)} produk...")
                 detailed = []
                 for c_i, cand in enumerate(candidates, start=1):
                     try:
-                        status_cb(f"  - Detail [{c_i}/{len(candidates)}]: {cand.get('product_name','(no name)')[:50]}...")
-                        detail = scrape_product_detail(page, cand["product_url"])
+                        product_url = cand.get("product_url", "")
+                        product_name = cand.get('product_name', '(no name)')
+                        logger.info(f"STEP: Scraping detail [{c_i}/{len(candidates)}] - {product_name[:50]}... | URL: {product_url[:70]}...")
+                        status_cb(f"  - Detail [{c_i}/{len(candidates)}]: {product_name[:50]}...")
+                        
+                        if not product_url:
+                            logger.warning(f"⚠️ Candidate {c_i} tidak punya URL, skip detail scraping")
+                            status_cb(f"    ⚠️ Skip: Tidak ada URL produk")
+                            continue
+                        
+                        detail = scrape_product_detail(page, product_url)
                         merged = {**cand, **detail}
                         merged["input_keyword"] = kw
                         merged["source_site"] = "tokopedia"
                         merged["scraped_at"] = _now_iso()
                         detailed.append(merged)
+                        logger.info(f"✅ Produk {c_i}: Deskripsi ({len(merged.get('description', ''))} chars), Foto ({len(merged.get('image_urls', []))} images)")
                     except Exception as e:
-                        logger.warning(f"Detail scrape gagal: {cand.get('product_url')} | {e}")
+                        logger.error(f"❌ Detail scrape gagal untuk candidate {c_i}: {cand.get('product_url')} | {e}")
+                        import traceback
+                        logger.debug(f"Traceback: {traceback.format_exc()}")
                         status_cb(f"    ⚠️ Skip: {str(e)[:50]}...")
                         continue
 
-                status_cb(f"  - Detail sukses: {len(detailed)}/{len(candidates)}")
+                status_cb(f"  - Detail sukses: {len(detailed)}/{len(candidates)} (dengan deskripsi & foto)")
 
                 if not detailed:
                     status_cb(f"  - ⚠️ Tidak ada detail berhasil diambil untuk '{kw}'")
                     continue
 
-                # 3) Rank & select top 5
-                status_cb(f"  - Meranking produk...")
-                top = rank_and_select_top_n(kw, detailed, top_n=config.MAX_PRODUCTS_PER_KEYWORD)
-                status_cb(f"  - Top {len(top)} terpilih")
+                # 3) Langsung pakai 2 produk (tidak perlu ranking karena hanya 2)
+                top = detailed[:2]  # Ambil maksimal 2 produk pertama
+                status_cb(f"  - ✅ {len(top)} produk siap (dengan deskripsi & foto)")
 
                 # 4) Download image (opsional)
                 if enable_image_download:
@@ -173,10 +186,30 @@ def run_pipeline(
 
             progress_cb(idx / max(len(keywords), 1))
 
+        # 6) Generate Excel output (setelah semua keyword selesai)
+        logger.info(f"STEP: Generating Excel output for {len(all_rows)} rows...")
         status_cb("Menyiapkan file Excel...")
-        excel_bytes = export_rows_to_excel_bytes(all_rows)
-        status_cb(f"✅ Pipeline selesai! Total {len(all_rows)} produk ditemukan.")
-        return all_rows, excel_bytes
+        try:
+            excel_bytes = export_rows_to_excel_bytes(all_rows)
+            logger.info(f"✅ Excel file generated successfully ({len(excel_bytes)} bytes)")
+            # Simpan juga ke folder output supaya ada file fisik
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path: Path = config.OUTPUT_DIR / f"tokopedia_product_refs_{ts}.xlsx"
+                out_path.write_bytes(excel_bytes)
+                logger.info(f"✅ Excel saved to: {out_path}")
+                status_cb(f"💾 Excel tersimpan: {out_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal simpan Excel ke disk: {e}")
+            status_cb(f"✅ Pipeline selesai! Total {len(all_rows)} produk ditemukan.")
+            return all_rows, excel_bytes
+        except Exception as e:
+            logger.error(f"❌ Failed to generate Excel: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            status_cb(f"⚠️ Gagal generate Excel: {str(e)}")
+            # Return rows anyway, tapi tanpa Excel bytes
+            return all_rows, None
 
     except Exception as e:
         error_msg = f"Fatal error di pipeline: {str(e)}"
@@ -281,24 +314,25 @@ def main():
                 progress_cb=progress_cb,
             )
 
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             if rows:
                 st.success(f"✅ Selesai! Total {len(rows)} produk ditemukan.")
                 status_cb(f"✅ Selesai! Total {len(rows)} produk ditemukan.")
 
                 df = pd.DataFrame(rows, columns=config.OUTPUT_SCHEMA)
                 st.dataframe(df, use_container_width=True)
-
-                if excel_bytes:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    st.download_button(
-                        "📥 Download Excel (.xlsx)",
-                        data=excel_bytes,
-                        file_name=f"tokopedia_product_refs_{ts}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
             else:
                 st.warning("⚠️ Tidak ada produk yang ditemukan. Coba keyword lain atau check log untuk detail.")
                 status_cb("⚠️ Tidak ada produk yang ditemukan.")
+
+            # Tetap tampilkan tombol download kalau excel_bytes ada (walau rows kosong)
+            if excel_bytes:
+                st.download_button(
+                    "📥 Download Excel (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"tokopedia_product_refs_{ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
         except KeyboardInterrupt:
             status_cb("❌ Dibatalkan oleh user.")
