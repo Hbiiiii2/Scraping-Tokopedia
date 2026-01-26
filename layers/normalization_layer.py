@@ -9,6 +9,8 @@ price
 currency
 image_url
 image_local_path
+image_urls
+image_local_paths
 store_name
 product_url
 source_site
@@ -21,6 +23,17 @@ from typing import Dict, Any
 
 import config
 from utils.helpers import extract_price_number, extract_currency
+
+
+def _list_to_newline_text(v: Any) -> str:
+    """
+    Excel-friendly: list -> newline-separated text.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple, set)):
+        return "\n".join([str(x).strip() for x in v if str(x).strip()])
+    return str(v).strip()
 
 
 def normalize_output_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -40,6 +53,8 @@ def normalize_output_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "currency": currency,
         "image_url": (row.get("image_url") or "").strip(),
         "image_local_path": (row.get("image_local_path") or "").strip(),
+        "image_urls": _list_to_newline_text(row.get("image_urls")),
+        "image_local_paths": _list_to_newline_text(row.get("image_local_paths")),
         "store_name": (row.get("store_name") or "").strip(),
         "product_url": (row.get("product_url") or "").strip(),
         "source_site": (row.get("source_site") or "tokopedia").strip(),

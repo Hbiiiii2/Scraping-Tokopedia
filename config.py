@@ -66,10 +66,12 @@ OUTPUT_SCHEMA = [
     "currency",
     "image_url",
     "image_local_path",
+    "image_urls",
+    "image_local_paths",
     "store_name",
     "product_url",
     "source_site",
     "scraped_at"
 ]
 
-# Note: image_urls (list) tidak termasuk di schema Excel, tapi tersedia di data
+# Note: image_urls/image_local_paths disimpan sebagai teks (newline-separated)

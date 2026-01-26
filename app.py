@@ -46,7 +46,7 @@ from layers.input_layer import load_keywords_from_upload, load_keywords_from_man
 from layers.search_layer import search_candidates, TokopediaBlockedError
 from layers.detail_layer import scrape_product_detail
 from layers.ranking_layer import rank_and_select_top_n
-from layers.image_layer import download_product_image
+from layers.image_layer import download_product_image, download_product_images
 from layers.normalization_layer import normalize_output_row
 from layers.output_layer import export_rows_to_excel_bytes
 
@@ -151,25 +151,49 @@ def run_pipeline(
                 for t in top:
                     if not enable_image_download:
                         t["image_local_path"] = ""
+                        t["image_local_paths"] = []
                         continue
                     try:
-                        # Download primary image
-                        image_url = t.get("image_url", "")
-                        if not image_url and "image_urls" in t and t["image_urls"]:
-                            image_url = t["image_urls"][0]  # Use first image from list
-                        
-                        if image_url:
-                            local_path = download_product_image(
-                                keyword=kw,
-                                product_name=t.get("product_name", ""),
-                                image_url=image_url,
-                            )
-                            t["image_local_path"] = str(local_path) if local_path else ""
+                        product_name = t.get("product_name", "") or ""
+
+                        # Prioritaskan semua foto dari detail page
+                        image_urls = t.get("image_urls") or []
+                        if not isinstance(image_urls, list):
+                            image_urls = [str(image_urls)]
+
+                        # Fallback: kalau detail belum ngasih list, pakai primary image_url
+                        if not image_urls:
+                            primary = t.get("image_url", "") or ""
+                            if primary:
+                                image_urls = [primary]
+
+                        saved_paths = download_product_images(
+                            keyword=kw,
+                            product_name=product_name,
+                            image_urls=image_urls,
+                        )
+
+                        t["image_local_paths"] = [str(p) for p in saved_paths]
+
+                        # Backward-compat kolom lama: 1 foto utama
+                        if saved_paths:
+                            t["image_local_path"] = str(saved_paths[0])
                         else:
-                            t["image_local_path"] = ""
+                            # Fallback lama (kalau multi-download 0) coba single download
+                            image_url = t.get("image_url", "") or (image_urls[0] if image_urls else "")
+                            if image_url:
+                                local_path = download_product_image(
+                                    keyword=kw,
+                                    product_name=product_name,
+                                    image_url=image_url,
+                                )
+                                t["image_local_path"] = str(local_path) if local_path else ""
+                            else:
+                                t["image_local_path"] = ""
                     except Exception as e:
                         logger.warning(f"Download image gagal: {t.get('image_url')} | {e}")
                         t["image_local_path"] = ""
+                        t["image_local_paths"] = []
 
                 # 5) Normalize output schema
                 for t in top:
