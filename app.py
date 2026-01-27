@@ -61,6 +61,8 @@ def run_pipeline(
     enable_image_download: bool,
     status_cb,
     progress_cb,
+    image_base_folder: str,
+    products_per_keyword: int = 5,
 ) -> tuple[List[Dict[str, Any]], Optional[bytes]]:
     """
     Jalankan end-to-end pipeline untuk banyak keyword.
@@ -89,10 +91,10 @@ def run_pipeline(
             progress_cb((idx - 1) / max(len(keywords), 1))
 
             try:
-                # 1) Search candidates - HANYA 2 PRODUK (untuk mempercepat)
-                status_cb(f"  - Mencari produk untuk '{kw}' (maksimal 2 produk)...")
+                # 1) Search candidates
+                status_cb(f"  - Mencari produk untuk '{kw}' (maks. {products_per_keyword} produk)...")
                 try:
-                    candidates = search_candidates(page, kw, max_candidates=2)
+                    candidates = search_candidates(page, kw, max_candidates=products_per_keyword)
                 except TokopediaBlockedError as be:
                     # Ini kondisi nyata: captcha/blocked. Beri instruksi jelas.
                     status_cb("  - ❌ Tokopedia meminta verifikasi / captcha.")
@@ -123,6 +125,10 @@ def run_pipeline(
                         
                         detail = scrape_product_detail(page, product_url)
                         merged = {**cand, **detail}
+                        # Fallback: jika detail tidak dapat price, pakai dari hasil search
+                        if (merged.get("price") is None or merged.get("price") == "") and cand.get("price") is not None:
+                            merged["price"] = cand["price"]
+                            merged["currency"] = merged.get("currency") or cand.get("currency") or "IDR"
                         merged["input_keyword"] = kw
                         merged["source_site"] = "tokopedia"
                         merged["scraped_at"] = _now_iso()
@@ -141,33 +147,87 @@ def run_pipeline(
                     status_cb(f"  - ⚠️ Tidak ada detail berhasil diambil untuk '{kw}'")
                     continue
 
-                # 3) Langsung pakai 2 produk (tidak perlu ranking karena hanya 2)
-                top = detailed[:2]  # Ambil maksimal 2 produk pertama
+                # 3) Ambil sesuai scope yang diminta
+                top = detailed[:products_per_keyword]
                 status_cb(f"  - ✅ {len(top)} produk siap (dengan deskripsi & foto)")
 
                 # 4) Download image (opsional)
-                if enable_image_download:
-                    status_cb(f"  - Download gambar ({len(top)} produk)...")
+                # for t in top:
+                #     if not enable_image_download:
+                #         t["image_local_path"] = ""
+                #         t["image_local_paths"] = []
+                #         continue
+                    
+                #     current_images = []
+                #     try:
+                #         product_name = t.get("product_name", "") or ""
+
+                #         # Prioritaskan semua foto dari detail page
+                #         image_urls = t.get("image_urls") or []
+                #         if not isinstance(image_urls, list):
+                #             image_urls = [str(image_urls)]
+
+                #         # Fallback: kalau detail belum ngasih list, pakai primary image_url
+                #         if not image_urls:
+                #             primary = t.get("image_url", "") or ""
+                #             if primary:
+                #                 image_urls = [primary]
+
+                #         saved_paths = download_product_images(
+                #             session_name=session_name,
+                #             keyword=kw,
+                #             product_name=product_name,
+                #             image_urls=image_urls,
+                #         )
+
+                #         t["image_local_paths"] = [str(p) for p in saved_paths]
+
+                #         # Backward-compat kolom lama: 1 foto utama
+                #         if saved_paths:
+                #             t["image_local_path"] = str(saved_paths[0])
+                #         else:
+                #             # Fallback lama (kalau multi-download 0) coba single download
+                #             image_url = t.get("image_url", "") or (image_urls[0] if image_urls else "")
+                #             if image_url:
+                #                 local_path = download_product_image(
+                #                     session_name=session_name,
+                #                     keyword=kw,
+                #                     product_name=product_name,
+                #                     image_url=image_url,
+                #                 )
+                #                 t["image_local_path"] = str(local_path) if local_path else ""
+                #             else:
+                #                 t["image_local_path"] = ""
+                #     except Exception as e:
+                #         logger.warning(f"Download image gagal: {t.get('image_url')} | {e}")
+                #         t["image_local_path"] = ""
+                #         t["image_local_paths"] = []
+# 4) Download image (opsional)
                 for t in top:
                     if not enable_image_download:
                         t["image_local_path"] = ""
                         t["image_local_paths"] = []
                         continue
+                    
                     try:
-                        product_name = t.get("product_name", "") or ""
-
-                        # Prioritaskan semua foto dari detail page
+                        product_name = t.get("product_name", "") or "product"
+                        
+                        # Inisialisasi variabel di dalam try agar fresh untuk setiap produk
                         image_urls = t.get("image_urls") or []
+                        
+                        # Pastikan formatnya list
                         if not isinstance(image_urls, list):
                             image_urls = [str(image_urls)]
 
-                        # Fallback: kalau detail belum ngasih list, pakai primary image_url
+                        # Fallback ke URL utama jika list detail kosong
                         if not image_urls:
-                            primary = t.get("image_url", "") or ""
-                            if primary:
-                                image_urls = [primary]
+                            primary_url = t.get("image_url", "")
+                            if primary_url:
+                                image_urls = [primary_url]
 
+                        # Panggil download multi-images (per keyword untuk klasifikasi)
                         saved_paths = download_product_images(
+                            base_folder=image_base_folder,
                             keyword=kw,
                             product_name=product_name,
                             image_urls=image_urls,
@@ -175,26 +235,27 @@ def run_pipeline(
 
                         t["image_local_paths"] = [str(p) for p in saved_paths]
 
-                        # Backward-compat kolom lama: 1 foto utama
+                        # Update path utama untuk kolom Excel
                         if saved_paths:
                             t["image_local_path"] = str(saved_paths[0])
                         else:
-                            # Fallback lama (kalau multi-download 0) coba single download
-                            image_url = t.get("image_url", "") or (image_urls[0] if image_urls else "")
-                            if image_url:
+                            # Fallback terakhir ke single download jika multi-download gagal/kosong
+                            final_fallback_url = t.get("image_url", "") or (image_urls[0] if image_urls else "")
+                            if final_fallback_url:
                                 local_path = download_product_image(
+                                    base_folder=image_base_folder,
                                     keyword=kw,
                                     product_name=product_name,
-                                    image_url=image_url,
+                                    image_url=final_fallback_url,
                                 )
                                 t["image_local_path"] = str(local_path) if local_path else ""
                             else:
                                 t["image_local_path"] = ""
+
                     except Exception as e:
-                        logger.warning(f"Download image gagal: {t.get('image_url')} | {e}")
+                        logger.warning(f"Download image gagal untuk produk '{t.get('product_name', 'Unknown')[:30]}': {e}")
                         t["image_local_path"] = ""
                         t["image_local_paths"] = []
-
                 # 5) Normalize output schema
                 for t in top:
                     all_rows.append(normalize_output_row(t))
@@ -257,6 +318,7 @@ def run_pipeline(
 def main():
     st.set_page_config(page_title="Tokopedia Product Reference Extractor", layout="wide")
     st.title("Tokopedia Product Reference Extraction Tool")
+    
 
     st.caption(
         "⚠️ Tokopedia JS-rendered + anti-bot. Selector bisa berubah; tool ini butuh maintenance berkala."
@@ -281,8 +343,16 @@ def main():
         manual = st.text_area("Manual keyword (1 baris = 1 keyword)", height=180)
 
         st.subheader("Opsi")
+        products_per_keyword = st.number_input(
+            "Jumlah produk per keyword",
+            min_value=1,
+            max_value=30,
+            value=5,
+            step=1,
+            help="Scope pencarian: berapa produk yang diambil untuk setiap 1 keyword.",
+        )
         enable_image_download = st.toggle("Download gambar", value=config.DOWNLOAD_IMAGES)
-        st.caption("Jika ON, gambar disimpan ke folder `images/<keyword>/`.")
+        st.caption("Jika ON, gambar disimpan ke `images/<nama_excel>/<keyword>/<nama_produk>/` (klasifikasi per keyword).")
 
         start = st.button("Mulai Scraping", type="primary")
 
@@ -301,11 +371,15 @@ def main():
 
     if start:
         try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_name = f"tokopedia_product_refs_{ts}"
+            # Folder gambar: pakai nama Excel (tanpa ekstensi) jika ada upload, else session
+            image_base_folder = Path(uploaded.name).stem if (uploaded and uploaded.name) else session_name
             # Log start session
             logger.info("=" * 60)
             logger.info("NEW SCRAPING SESSION STARTED")
             logger.info("=" * 60)
-            
+
             reset_browser()
             status_cb("Menyiapkan keyword...")
             logger.debug("Browser reset completed")
@@ -320,7 +394,7 @@ def main():
 
             keywords = normalize_keywords(keywords)
             logger.info(f"Normalized keywords: {keywords}")
-            
+
             if not keywords:
                 st.error("Tidak ada keyword yang valid.")
                 status_cb("❌ Tidak ada keyword yang valid.")
@@ -330,15 +404,17 @@ def main():
             status_cb(f"Total keyword: {len(keywords)}")
             status_cb("Memulai pipeline scraping...")
             logger.info(f"Starting pipeline with {len(keywords)} keywords: {keywords}")
-            
+
             rows, excel_bytes = run_pipeline(
                 keywords,
+                image_base_folder=image_base_folder,
                 enable_image_download=enable_image_download,
+                products_per_keyword=products_per_keyword,
                 status_cb=status_cb,
                 progress_cb=progress_cb,
             )
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
             if rows:
                 st.success(f"✅ Selesai! Total {len(rows)} produk ditemukan.")
                 status_cb(f"✅ Selesai! Total {len(rows)} produk ditemukan.")
@@ -354,7 +430,7 @@ def main():
                 st.download_button(
                     "📥 Download Excel (.xlsx)",
                     data=excel_bytes,
-                    file_name=f"tokopedia_product_refs_{ts}.xlsx",
+                    file_name=f"{session_name}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 

@@ -85,6 +85,63 @@ def _walk_strings(obj: Any) -> Iterable[str]:
             yield from _walk_strings(v)
 
 
+def _walk_dicts(obj: Any, depth: int = 0, max_depth: int = 15) -> Iterable[Dict]:
+    """Walk nested dicts untuk cari field harga di __NEXT_DATA__."""
+    if depth > max_depth:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_dicts(v, depth + 1, max_depth)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_dicts(v, depth + 1, max_depth)
+
+
+def _extract_price_from_next_data(detail_page) -> tuple:
+    """
+    Cari price dari script#__NEXT_DATA__ (Next.js).
+    Return (price: Optional[float], currency: str).
+    """
+    try:
+        node = detail_page.locator("script#__NEXT_DATA__")
+        if node.count() <= 0:
+            return (None, "IDR")
+        raw = (node.first.inner_text() or "").strip()
+        if not raw:
+            return (None, "IDR")
+        data = json.loads(raw)
+
+        # Nama kunci yang sering dipakai Tokopedia untuk harga
+        price_keys = (
+            "price", "priceInt", "priceValue", "productPrice", "finalPrice",
+            "amount", "value", "harga", "basePrice", "originalPrice",
+            "sellPrice", "formattedPrice", "product_price", "price_range",
+        )
+        for d in _walk_dicts(data):
+            if not isinstance(d, dict):
+                continue
+            for k, v in d.items():
+                if not k or not isinstance(k, str):
+                    continue
+                kl = k.lower()
+                if not any(pk in kl for pk in ("price", "amount", "harga", "value")):
+                    continue
+                # Numerik
+                if isinstance(v, (int, float)):
+                    if 100 <= v <= 1e13:  # kisaran IDR
+                        return (float(v), "IDR")
+                # String berformat "Rp 12.345" atau "12500"
+                if isinstance(v, str) and v.strip():
+                    num = extract_price_number(v)
+                    if num and 100 <= num <= 1e13:
+                        return (num, extract_currency(v))
+        return (None, "IDR")
+    except Exception as e:
+        logger.debug(f"__NEXT_DATA__ price parse failed: {e}")
+        return (None, "IDR")
+
+
 def _extract_images_from_next_data(detail_page) -> list[str]:
     """
     Tokopedia PDP biasanya Next.js. Banyak data gambar ada di script#__NEXT_DATA__.
@@ -200,15 +257,42 @@ def scrape_product_detail(page, product_url: str) -> Dict[str, Any]:
         )
         logger.debug(f"Title extracted: {title[:60]}...")
 
-        # Price: beberapa variasi testid; fallback teks "Rp"
+        # Price: variasikan selector dan fallback ke __NEXT_DATA__
         logger.debug("Extracting price...")
-        price_text = _safe_text(
-            detail_page.locator(
-                '[data-testid="lblPDPDetailProductPrice"], [data-testid="lblProductPrice"], div:has-text("Rp")'
-            )
-        )
-        price = extract_price_number(price_text)
-        currency = extract_currency(price_text)
+        price_selectors = [
+            '[data-testid="lblPDPDetailProductPrice"]',
+            '[data-testid="lblProductPrice"]',
+            '[data-testid="lblPDPDetailProductPrice"]',
+            '[data-testid*="rice"]',
+            '[data-testid*="Price"]',
+            'span[class*="price"]',
+            'div[class*="price"]',
+            'div[class*="Price"]',
+            'p:has-text("Rp")',
+            'div:has-text("Rp")',
+        ]
+        price_text = ""
+        for sel in price_selectors:
+            try:
+                loc = detail_page.locator(sel)
+                if loc.count() > 0:
+                    # Coba beberapa elemen; ambil yang berisi angka harga valid
+                    for i in range(min(loc.count(), 5)):
+                        t = (loc.nth(i).inner_text() or "").strip()
+                        if t and ("Rp" in t or "rp" in t.lower()) and any(c.isdigit() for c in t):
+                            num = extract_price_number(t)
+                            if num and 100 <= num <= 1e13:
+                                price_text = t
+                                break
+                    if price_text:
+                        break
+            except Exception:
+                continue
+        price = extract_price_number(price_text) if price_text else None
+        currency = extract_currency(price_text) if price_text else "IDR"
+        # Fallback: ambil dari __NEXT_DATA__
+        if price is None:
+            price, currency = _extract_price_from_next_data(detail_page)
         logger.debug(f"Price extracted: {price} {currency}")
 
         # Store name (toko)

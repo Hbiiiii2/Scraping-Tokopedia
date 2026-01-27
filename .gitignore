@@ -38,6 +38,7 @@ wheels/
 output/
 images/
 logs/
+user_data/
 *.xlsx
 *.csv
 temp/

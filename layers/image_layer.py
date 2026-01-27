@@ -36,24 +36,28 @@ def _deterministic_name(product_name: str, image_url: str) -> str:
     return f"{base}_{h}.jpg"
 
 
-def _product_dir(keyword: str, product_name: str) -> Path:
+def _product_dir(base_folder: str, keyword: str, product_name: str) -> Path:
     """
-    Simpan semua foto per produk:
-    images/<keyword_slug>/<product_slug>/
+    Simpan semua foto per produk, dikelompokkan per keyword:
+    images/<base_folder>/<keyword_slug>/<product_slug>/
+    - base_folder = nama Excel (tanpa ekstensi) atau session
+    - keyword_slug = klasifikasi per keyword
+    - product_slug = 1 folder per produk
     """
-    base = _keyword_dir(keyword)
+    folder_slug = slugify(base_folder) or "session"
+    kw_slug = slugify(keyword) or "keyword"
     prod_slug = slugify(product_name)[:80] or "product"
-    d = base / prod_slug
+    d = config.IMAGES_DIR / folder_slug / kw_slug / prod_slug
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 @retry(stop=stop_after_attempt(config.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=1, max=8))
-def download_product_image(*, keyword: str, product_name: str, image_url: str) -> Optional[Path]:
+def download_product_image(*, base_folder: str, keyword: str, product_name: str, image_url: str) -> Optional[Path]:
     if not image_url or not validate_image_url(image_url):
         return None
 
-    out_dir = _keyword_dir(keyword)
+    out_dir = _product_dir(base_folder, keyword, product_name)
     filename = _deterministic_name(product_name, image_url)
     out_path = out_dir / filename
 
@@ -93,10 +97,11 @@ def download_product_image(*, keyword: str, product_name: str, image_url: str) -
     return None
 
 
-def download_product_images(*, keyword: str, product_name: str, image_urls: List[str]) -> List[Path]:
+def download_product_images(*, base_folder: str, keyword: str, product_name: str, image_urls: List[str]) -> List[Path]:
     """
     Download semua foto dari detail produk.
     Return list path yang berhasil di-download.
+    Simpan ke: images/<base_folder>/<keyword_slug>/<product_slug>/
     """
     if not image_urls:
         return []
@@ -110,7 +115,7 @@ def download_product_images(*, keyword: str, product_name: str, image_urls: List
         seen.add(u)
         urls.append(u)
 
-    out_dir = _product_dir(keyword, product_name)
+    out_dir = _product_dir(base_folder, keyword, product_name)
     saved: List[Path] = []
 
     for idx, url in enumerate(urls, start=1):

@@ -39,17 +39,20 @@ def _list_to_newline_text(v: Any) -> str:
 def normalize_output_row(row: Dict[str, Any]) -> Dict[str, Any]:
     price_val = row.get("price")
     if not isinstance(price_val, (int, float)):
-        price_val = extract_price_number(str(price_val))
+        price_val = extract_price_number(str(price_val)) if (price_val is not None and str(price_val).strip()) else None
 
     currency = row.get("currency") or extract_currency(str(row.get("price", "")))
     if not currency:
         currency = "IDR"
 
+    # Pastikan price numeric untuk kolom Excel (termasuk 0)
+    price_out = None if (price_val is None or price_val == "") else float(price_val)
+
     out = {
         "input_keyword": (row.get("input_keyword") or "").strip(),
         "product_name": (row.get("product_name") or "").strip(),
         "description": (row.get("description") or "").strip(),
-        "price": float(price_val) if price_val else None,
+        "price": price_out,
         "currency": currency,
         "image_url": (row.get("image_url") or "").strip(),
         "image_local_path": (row.get("image_local_path") or "").strip(),

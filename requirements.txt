@@ -24,3 +24,5 @@ loguru==0.7.2
 
 # Event Loop Fix untuk Streamlit
 nest-asyncio==1.6.0
+
+seleniumbase
