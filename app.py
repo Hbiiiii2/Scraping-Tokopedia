@@ -129,6 +129,9 @@ def run_pipeline(
                         if (merged.get("price") is None or merged.get("price") == "") and cand.get("price") is not None:
                             merged["price"] = cand["price"]
                             merged["currency"] = merged.get("currency") or cand.get("currency") or "IDR"
+                        # Fallback: jika detail tidak dapat store_name, pakai dari hasil search
+                        if not (merged.get("store_name") or "").strip() and (cand.get("store_name") or "").strip():
+                            merged["store_name"] = (cand.get("store_name") or "").strip()
                         merged["input_keyword"] = kw
                         merged["source_site"] = "tokopedia"
                         merged["scraped_at"] = _now_iso()

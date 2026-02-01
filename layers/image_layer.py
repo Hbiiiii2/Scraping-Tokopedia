@@ -11,6 +11,7 @@ Kebutuhan:
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Optional, List
 
@@ -21,6 +22,30 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
 from utils.helpers import validate_image_url
+
+# Ukuran target untuk gambar (Tokopedia CDN pakai resize-jpeg:700:0, kita naikkan ke 2000)
+IMAGE_UPSCALE_SIZE = 2000
+
+
+def _upscale_image_url(url: str, target_size: int = IMAGE_UPSCALE_SIZE) -> str:
+    """
+    Coba ubah URL gambar thumbnail ke ukuran lebih besar agar download HD.
+    Tokopedia CDN pakai pattern: resize-jpeg:700:0, resize-webp:200:0, dll.
+    """
+    if not url or not isinstance(url, str):
+        return url or ""
+    u = url.strip()
+    # Tokopedia CDN: resize-jpeg:NNN:0 atau resize-webp:NNN:0 -> ubah ke target_size
+    u = re.sub(r"resize-jpeg:\d+:", f"resize-jpeg:{target_size}:", u)
+    u = re.sub(r"resize-webp:\d+:", f"resize-webp:{target_size}:", u)
+    # Pola dimensi di path: /100x100/, /200x200/ -> ukuran lebih besar
+    u = re.sub(r"/\d{2,4}x\d{2,4}/", f"/{target_size}x{target_size}/", u, flags=re.IGNORECASE)
+    # Query params: w=100&h=100 -> w=target_size&h=target_size
+    u = re.sub(r"([?&])w=\d+", f"\\1w={target_size}", u, flags=re.IGNORECASE)
+    u = re.sub(r"([?&])h=\d+", f"\\1h={target_size}", u, flags=re.IGNORECASE)
+    u = re.sub(r"([?&])width=\d+", f"\\1width={target_size}", u, flags=re.IGNORECASE)
+    u = re.sub(r"([?&])height=\d+", f"\\1height={target_size}", u, flags=re.IGNORECASE)
+    return u
 
 
 def _keyword_dir(keyword: str) -> Path:
@@ -56,6 +81,8 @@ def _product_dir(base_folder: str, keyword: str, product_name: str) -> Path:
 def download_product_image(*, base_folder: str, keyword: str, product_name: str, image_url: str) -> Optional[Path]:
     if not image_url or not validate_image_url(image_url):
         return None
+    # Up-scale URL ke resolusi lebih besar agar gambar tidak kecil
+    image_url = _upscale_image_url(image_url)
 
     out_dir = _product_dir(base_folder, keyword, product_name)
     filename = _deterministic_name(product_name, image_url)
@@ -121,6 +148,8 @@ def download_product_images(*, base_folder: str, keyword: str, product_name: str
     for idx, url in enumerate(urls, start=1):
         if not validate_image_url(url):
             continue
+        # Up-scale URL ke resolusi lebih besar agar gambar tidak kecil
+        url = _upscale_image_url(url)
 
         # Nama file deterministik + prefix index biar urutan kebaca
         filename = _deterministic_name(product_name, url)
